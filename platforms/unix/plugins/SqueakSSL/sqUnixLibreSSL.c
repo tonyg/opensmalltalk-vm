@@ -231,9 +231,12 @@ sqInt sqDestroySSL(sqInt handle) {
     sqSSL *ssl = sslFromHandle(handle);
     if (ssl == NULL) return 0;
 
+    if (ssl->tls) {
+        tls_close(ssl->tls);
+        tls_free(ssl->tls);
+    }
     if (ssl->config) tls_config_free(ssl->config);
-    if (ssl->tls) tls_free(ssl->tls);
-
+    
     free(ssl->certName);
     free(ssl->peerName);
     free(ssl->serverName);
@@ -404,20 +407,23 @@ sqInt sqAcceptSSL(sqInt handle, char* srcBuf, sqInt srcLen, char *dstBuf, sqInt 
         Returns: The size of the output generated or an error code.
 */
 sqInt sqEncryptSSL(sqInt handle, char* srcBuf, sqInt srcLen, char *dstBuf, sqInt dstLen) {
-    int nbytes;
     sqSSL *ssl = sslFromHandle(handle);
+    ssize_t out = 0;
 
-    fprintf(stderr, "alarm!\n");
-    return -1;
-#if 0
     if (ssl == NULL || ssl->state != SQSSL_CONNECTED) return SQSSL_INVALID_STATE;
 
-    LOG("Encrypting %ld bytes\n", (long)srcLen);
-
-    nbytes = SSL_write(ssl->ssl, srcBuf, srcLen);
-    if (nbytes != srcLen) return SQSSL_GENERIC_ERROR;
-    return sqCopyBioSSL(ssl, ssl->bioWrite, dstBuf, dstLen);
-#endif
+    LOG("Encrypting %" PRIdSQINT " bytes\n", srcLen);
+    SQSSL_SET_DST(ssl);
+    out = tls_write(ssl->tls, srcBuf, srcLen);
+    if (out <= 0) {
+        if (out == TLS_WANT_POLLIN || out == TLS_WANT_POLLOUT) {
+            return SQSSL_NEED_MORE_DATA;
+        } else {
+            return SQSSL_GENERIC_ERROR;
+        }
+    }
+    LOG("out: %zu, transf: %" PRIdSQINT " bytes\n", out, ssl->iostate.transferred);
+    SQSSL_RETURN_TRANSFERRED(ssl);
 }
 
 /* sqDecryptSSL: Decrypt data for SSL transmission.
@@ -430,26 +436,26 @@ sqInt sqEncryptSSL(sqInt handle, char* srcBuf, sqInt srcLen, char *dstBuf, sqInt
         Returns: The size of the output generated or an error code.
 */
 sqInt sqDecryptSSL(sqInt handle, char* srcBuf, sqInt srcLen, char *dstBuf, sqInt dstLen) {
-    int nbytes;
     sqSSL *ssl = sslFromHandle(handle);
+    ssize_t in = 0;
 
-    fprintf(stderr, "alarm!\n");
-    return -1;
-#if 0
     if (ssl == NULL || ssl->state != SQSSL_CONNECTED) return SQSSL_INVALID_STATE;
 
-    nbytes = BIO_write(ssl->bioRead, srcBuf, srcLen);
-    if (nbytes != srcLen) return SQSSL_GENERIC_ERROR;
-    nbytes = SSL_read(ssl->ssl, dstBuf, dstLen);
-    if (nbytes <= 0) {
-        int error = SSL_get_error(ssl->ssl, nbytes);
-        if (error != SSL_ERROR_WANT_READ && error != SSL_ERROR_ZERO_RETURN) {
+    LOG("Decrypting %" PRIdSQINT " bytes\n", srcLen);
+
+    if (srcLen == 0)  /* ??? */ return 0;
+
+
+    SQSSL_SET_SRC(ssl);
+    in = tls_read(ssl->tls, dstBuf, dstLen);
+    if (in <= 0) {
+        if (in == TLS_WANT_POLLIN || in == TLS_WANT_POLLOUT) {
+            return SQSSL_NEED_MORE_DATA;
+        } else {
             return SQSSL_GENERIC_ERROR;
         }
-        nbytes = 0;
     }
-    return nbytes;
-#endif
+    return in;
 }
 
 /* sqGetStringPropertySSL: Retrieve a string property from SSL.
