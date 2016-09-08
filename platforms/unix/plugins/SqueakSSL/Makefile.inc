@@ -8,7 +8,7 @@ LIBRESSL := $(THIS_DIR)/../../../libressl
 TARGET= [target]
 
 XINCLUDES=	[includes] -I$(LIBRESSL)/dist/include
-XLDFLAGS=	-Wl,--no-as-needed -lrt -Wl,-Bstatic -ltls -lcrypto -lssl -Wl,-Bdynamic -lrt
+XLDFLAGS=	-L$(LIBRESSL)/dist/lib -Wl,--no-as-needed -lrt -Wl,-Bstatic -ltls -lcrypto -lssl -Wl,-Bdynamic -lrt
 
 Makefile : $(LIBRESSL)/dist/lib/libtls.a
 
