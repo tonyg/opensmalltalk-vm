@@ -24,8 +24,9 @@ typedef struct sqSSL {
     char *peerName;
     char *serverName;
 
-    struct tls* tls;
     struct tls_config* config;
+    struct tls* tls;
+    struct tls* server_tls;
     struct {
         char* writeBuf;
         sqInt writeLen;
@@ -43,38 +44,21 @@ enum ssl_side { CLIENT = 0, SERVER = 1};
 static const size_t DNS_NAME_MAX = 255;
 
 sqInt sqSetupSSL(sqSSL* ssl, int isServer);
+sqInt sqHandshakeSSL(sqSSL* ssl, char* srcBuf, sqInt srcLen, char* dstBuf, sqInt dstLen);
 
-#define SQSSL_SET_DST(ssl)                      \
-    (                                           \
-    (ssl)->iostate.writeBuf = NULL,             \
-    (ssl)->iostate.writeLen = 0,                \
-    (ssl)->iostate.readBuf = dstBuf,            \
-    (ssl)->iostate.readLen= dstLen,             \
-    (ssl)->iostate.transferred = 0)
+#define SQSSL_SET_DST(ssl)			\
+    ((ssl)->iostate.writeBuf = dstBuf,		\
+     (ssl)->iostate.writeLen = dstLen)
 
-#define SQSSL_SET_SRC(ssl)                      \
-    (                                           \
-    (ssl)->iostate.writeBuf = srcBuf,           \
-    (ssl)->iostate.writeLen = srcLen,           \
-    (ssl)->iostate.readBuf = NULL,              \
-    (ssl)->iostate.readLen= 0,                  \
-    (ssl)->iostate.transferred = 0)
+#define SQSSL_SET_SRC(ssl)	      \
+    ((ssl)->iostate.readBuf = srcBuf, \
+     (ssl)->iostate.readLen = srcLen) \
 
-#define SQSSL_SET_SRC_DST(ssl)                  \
-    (                                           \
-    (ssl)->iostate.writeBuf = srcBuf,           \
-    (ssl)->iostate.writeLen = srcLen,           \
-    (ssl)->iostate.readBuf = dstBuf,            \
-    (ssl)->iostate.readLen= dstLen,             \
-    (ssl)->iostate.transferred = 0)
-
-#define SQSSL_SET_DST_SRC(ssl)                  \
-    (                                           \
-    (ssl)->iostate.writeBuf = dstBuf,           \
-    (ssl)->iostate.writeLen = dstLen,           \
-    (ssl)->iostate.readBuf = srcBuf,            \
-    (ssl)->iostate.readLen= srcLen,             \
-    (ssl)->iostate.transferred = 0)
+#define SQSSL_SET_DST_SRC(ssl)	       \
+    ((ssl)->iostate.writeBuf = dstBuf, \
+     (ssl)->iostate.writeLen = dstLen, \
+     (ssl)->iostate.readBuf = srcBuf,  \
+     (ssl)->iostate.readLen= srcLen)
 
 #define SQSSL_RETURN_TRANSFERRED(ssl) do {            \
     sqInt __transferred = (ssl)->iostate.transferred; \
@@ -92,7 +76,7 @@ sqInt sqSetupSSL(sqSSL* ssl, int isServer);
 #define len(x) ssl->iostate.x##Len
 #define buf(x) ssl->iostate.x##Buf
 
-ssize_t sqReadSSL(void* tls, void* buffer, size_t buflen, void* payload)
+ssize_t sqReadSSL(struct tls* tls, void* buffer, size_t buflen, void* payload)
 {
     sqSSL* ssl = (sqSSL*) payload;
     size_t copied = 0;
@@ -120,7 +104,7 @@ ssize_t sqReadSSL(void* tls, void* buffer, size_t buflen, void* payload)
     return copied;
 }
 
-ssize_t sqWriteSSL(void* tls, const void* buf, size_t buflen, void* payload)
+ssize_t sqWriteSSL(struct tls* tls, const void* buf, size_t buflen, void* payload)
 {
     sqSSL* ssl = (sqSSL*) payload;
     LOG("%zu bytes pending; buffer size %" PRIdSQINT " bytes\n",
@@ -148,8 +132,9 @@ static sqSSL *sslFromHandle(sqInt handle) {
 
 /* sqSetupSSL: Common SSL setup tasks */
 sqInt sqSetupSSL(sqSSL *ssl, int side) {
-
-    if (ssl->tls != NULL || ssl->config == NULL) return -1;
+    struct tls* the_tls = NULL;
+    
+    if (ssl->tls != NULL || ssl->server_tls != NULL || ssl->config == NULL) return -1;
 
     /* if a cert is provided, use it */
     if (ssl->certName) {
@@ -157,18 +142,19 @@ sqInt sqSetupSSL(sqSSL *ssl, int side) {
         if (tls_config_set_cert_file(ssl->config, ssl->certName) == -1) goto err;
         if (tls_config_set_key_file(ssl->config, ssl->certName) == -1) goto err;
     }
+    /* XXX: TODO: fix */
     tls_config_insecure_noverifycert(ssl->config);
     tls_config_insecure_noverifyname(ssl->config);
 
     if (side == CLIENT) {
-        ssl->tls = tls_client();
+        the_tls = ssl->tls = tls_client();
     } else if (side == SERVER) {
-        ssl->tls = tls_server();
+        the_tls = ssl->server_tls = tls_server();
     }
 
-    if (ssl->tls == NULL) goto err;
+    if (the_tls == NULL) goto err;
 
-    if (tls_configure(ssl->tls, ssl->config) == -1) goto err;
+    if (tls_configure(the_tls, ssl->config) == -1) goto err;
 
     return 1;
 
@@ -232,8 +218,14 @@ sqInt sqDestroySSL(sqInt handle) {
     if (ssl == NULL) return 0;
 
     if (ssl->tls) {
+        /* TODO: closing communication */
         tls_close(ssl->tls);
         tls_free(ssl->tls);
+    }
+    if (ssl->server_tls) {
+        /* TODO: closing communication */
+        tls_close(ssl->server_tls);
+        tls_free(ssl->server_tls);
     }
     if (ssl->config) tls_config_free(ssl->config);
     
@@ -247,45 +239,16 @@ sqInt sqDestroySSL(sqInt handle) {
     return 1;
 }
 
-/* sqConnectSSL: Start/continue an SSL client handshake.
-        Arguments:
-                handle - the SSL handle
-                srcBuf - the input token sent by the remote peer
-                srcLen - the size of the input token
-                dstBuf - the output buffer for a new token
-                dstLen - the size of the output buffer
-        Returns: The size of the output token or an error code.
-*/
-sqInt sqConnectSSL(sqInt handle, char* srcBuf, sqInt srcLen, char *dstBuf, sqInt dstLen) {
-    ssize_t handshake_result = 0;
-    sqSSL *ssl = sslFromHandle(handle);
 
-    LOG("%p\n", ssl);
-
-    /* Verify state of session */
-    if (ssl == NULL || (ssl->state != SQSSL_UNUSED && ssl->state != SQSSL_CONNECTING)) {
-        return SQSSL_INVALID_STATE;
-    }
-
-    if (srcLen > 0) LOG("push %ld bytes\n", (long)srcLen);
-    SQSSL_SET_DST_SRC(ssl);
-
-    /* Establish initial connection */
-    if (ssl->state == SQSSL_UNUSED) {
-        ssl->state = SQSSL_CONNECTING;
-        LOG("Setting up SSL\n");
-        if (sqSetupSSL(ssl, 0) == -1) return SQSSL_GENERIC_ERROR;
-
-        if (tls_connect_cbs(ssl->tls, sqReadSSL, sqWriteSSL, ssl, ssl->serverName) == -1) {
-            fprintf(stderr, "%s\n", tls_error(ssl->tls));
-            return SQSSL_GENERIC_ERROR;
-        }
-    }
-
+sqInt sqHandshakeSSL(sqSSL* ssl, char* srcBuf, sqInt srcLen, char* dstBuf, sqInt dstLen)
+{
+    ssize_t handshake_result = -1;
     /* Do handshake (may return here on POLLIN) */
     handshake_result = tls_handshake(ssl->tls);
     if (handshake_result != 0) {
-        if (handshake_result != TLS_WANT_POLLIN) {
+        if (handshake_result != TLS_WANT_POLLIN &&
+            handshake_result != TLS_WANT_POLLOUT
+        ) {
             LOG("handshake failed (%zd)\n", handshake_result);
             fprintf(stdout, "%s\n", tls_error(ssl->tls));
             return SQSSL_GENERIC_ERROR;
@@ -299,17 +262,59 @@ sqInt sqConnectSSL(sqInt handle, char* srcBuf, sqInt srcLen, char *dstBuf, sqInt
     LOG("connected\n");
     ssl->state = SQSSL_CONNECTED;
 
-
-    if (ssl->serverName != NULL &&
-        tls_peer_cert_contains_name(ssl->tls, ssl->serverName)) {
-        ssl->peerName = strndup(ssl->serverName,
-                                strnlen(ssl->serverName,
-                                        DNS_NAME_MAX));
+    if (tls_peer_cert_provided(ssl->tls) == 1) {
+        if (ssl->serverName != NULL &&
+            tls_peer_cert_contains_name(ssl->tls, ssl->serverName)) {
+            ssl->peerName = strndup(ssl->serverName,
+                                    strnlen(ssl->serverName,
+                                            DNS_NAME_MAX));
+        } else {
+            ssl->peerName = sqExtractCNFromSubject(tls_peer_cert_subject(ssl->tls));
+        }
+        LOG("peerName = %s\n", ssl->peerName);
     } else {
-        ssl->peerName = sqExtractCNFromSubject(tls_peer_cert_subject(ssl->tls));
+        LOG("No peer cert\n");
+        ssl->certFlags = SQSSL_NO_CERTIFICATE;
     }
-    LOG("peerName = %s\n", ssl->peerName);
-    return 0;
+    SQSSL_RETURN_TRANSFERRED(ssl);
+}
+
+
+/* sqConnectSSL: Start/continue an SSL client handshake.
+        Arguments:
+                handle - the SSL handle
+                srcBuf - the input token sent by the remote peer
+                srcLen - the size of the input token
+                dstBuf - the output buffer for a new token
+                dstLen - the size of the output buffer
+        Returns: The size of the output token or an error code.
+*/
+sqInt sqConnectSSL(sqInt handle, char* srcBuf, sqInt srcLen, char *dstBuf, sqInt dstLen)
+{
+    sqSSL *ssl = sslFromHandle(handle);
+    LOG("%p\n", ssl);
+
+    /* Verify state of session */
+    if (ssl == NULL || (ssl->state != SQSSL_UNUSED && ssl->state != SQSSL_CONNECTING)) {
+        return SQSSL_INVALID_STATE;
+    }
+
+    if (srcLen > 0) LOG("push %ld bytes\n", (long)srcLen);
+    SQSSL_SET_DST_SRC(ssl);
+
+    if (ssl->state == SQSSL_UNUSED) {
+        /* Establish initial connection */
+        ssl->state = SQSSL_CONNECTING;
+        LOG("Setting up SSL\n");
+        if (sqSetupSSL(ssl, 0) == -1) return SQSSL_GENERIC_ERROR;
+
+        if (tls_connect_cbs(ssl->tls, sqReadSSL, sqWriteSSL, ssl, ssl->serverName) == -1) {
+            fprintf(stderr, "%s\n", tls_error(ssl->tls));
+            return SQSSL_GENERIC_ERROR;
+        }
+    }
+    LOG("Proceed handshake\n");
+    return sqHandshakeSSL(ssl, srcBuf, srcLen, dstBuf, dstLen);
 }
 
 /* sqAcceptSSL: Start/continue an SSL server handshake.
@@ -322,79 +327,31 @@ sqInt sqConnectSSL(sqInt handle, char* srcBuf, sqInt srcLen, char *dstBuf, sqInt
         Returns: The size of the output token or an error code.
 */
 sqInt sqAcceptSSL(sqInt handle, char* srcBuf, sqInt srcLen, char *dstBuf, sqInt dstLen) {
-    ssize_t handshake_result;
-    sqSSL *ssl = sslFromHandle(handle);
 
-    if (1) return -1;
-#if 0
+  sqSSL *ssl = sslFromHandle(handle);
+
+    LOG("%p\n", ssl);
+
     /* Verify state of session */
     if (ssl == NULL || (ssl->state != SQSSL_UNUSED && ssl->state != SQSSL_ACCEPTING)) {
         return SQSSL_INVALID_STATE;
     }
 
-    /* Establish initial connection */
+    if (srcLen > 0) LOG("push %ld bytes\n", (long)srcLen);
+    SQSSL_SET_DST_SRC(ssl);
+
     if (ssl->state == SQSSL_UNUSED) {
+        /* Establish initial connection */
         ssl->state = SQSSL_ACCEPTING;
         LOG("Setting up SSL\n");
-        if (!sqSetupSSL(ssl, 1)) return SQSSL_GENERIC_ERROR;
-        LOG("setting accept state\n");
-        SSL_set_accept_state(ssl->ssl);
-    }
-
-    LOG("BIO_write %ld bytes\n", (long)srcLen);
-
-    n = BIO_write(ssl->bioRead, srcBuf, srcLen);
-
-    if (n < srcLen) {
-        LOG("BIO_write wrote less than expected\n");
-        return SQSSL_GENERIC_ERROR;
-    }
-    if (n < 0) {
-        LOG("BIO_write failed\n");
-        return SQSSL_GENERIC_ERROR;
-    }
-
-    LOG("SSL_accept\n");
-    result = SSL_accept(ssl->ssl);
-
-    if (result <= 0) {
-        int count = 0;
-        int error = SSL_get_error(ssl->ssl, result);
-        if (error != SSL_ERROR_WANT_READ) {
-            LOG("SSL_accept failed\n");
-            ERR_print_errors_fp(stdout);
+        if (sqSetupSSL(ssl, 1) == -1) return SQSSL_GENERIC_ERROR;
+        if (tls_accept_cbs(ssl->server_tls, &ssl->tls, sqReadSSL, sqWriteSSL, ssl) == -1) {
+            fprintf(stderr, "%s\n", tls_error(ssl->tls));
             return SQSSL_GENERIC_ERROR;
         }
-        LOG("sqCopyBioSSL\n");
-        count = sqCopyBioSSL(ssl, ssl->bioWrite, dstBuf, dstLen);
-        return count ? count : SQSSL_NEED_MORE_DATA;
     }
-
-    /* We are connected. Verify the cert. */
-    ssl->state = SQSSL_CONNECTED;
-
-    LOG("SSL_get_peer_certificate\n");
-    cert = SSL_get_peer_certificate(ssl->ssl);
-    LOG("cert = %p\n", cert);
-
-    if (cert) {
-        X509_NAME_get_text_by_NID(X509_get_subject_name(cert),
-                                  NID_commonName, peerName,
-                                  sizeof(peerName));
-        LOG("peerName = %s\n", peerName);
-        ssl->peerName = strndup(peerName, sizeof(peerName) - 1);
-        X509_free(cert);
-
-        /* Check the result of verification */
-        result = SSL_get_verify_result(ssl->ssl);
-        LOG("SSL_get_verify_result = %d\n", result);
-        /* FIXME: Figure out the actual failure reason */
-        ssl->certFlags = result ? SQSSL_OTHER_ISSUE : SQSSL_OK;
-    } else {
-        ssl->certFlags = SQSSL_NO_CERTIFICATE;
-    }
-    return sqCopyBioSSL(ssl, ssl->bioWrite, dstBuf, dstLen);
-#endif
+    LOG("Proceed handshake\n");
+    return sqHandshakeSSL(ssl, srcBuf, srcLen, dstBuf, dstLen);
 }
 
 /* sqEncryptSSL: Encrypt data for SSL transmission.
