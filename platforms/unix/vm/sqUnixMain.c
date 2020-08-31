@@ -862,6 +862,11 @@ sqInt  primitivePluginRequestState(void)	{ return dpy->primitivePluginRequestSta
 
 /*** errors ***/
 
+#ifdef MUSL
+void pushOutputFile(char *fileNameOrStdioIndex) {;}
+void popOutputFile() {;}
+#endif
+
 static void outOfMemory(void)
 {
   /* pushing stderr outputs the error report on stderr instead of stdout */
